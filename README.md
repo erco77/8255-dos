@@ -1,5 +1,5 @@
 # 8255-dos
-![screenshot](https://github.com/erco77/8255-dos/blob/master/8255-screenshot.jpg)
+![screenshot](https://github.com/erco77/8255-dos/blob/main/8255-screenshot.jpg)
 
 Builds in Turbo C 3.0; see Makefile
 
@@ -17,16 +17,16 @@ Lines shown in BOLD are "input" signals. The rest are "outputs". Which is which 
 
 The STATE column monitors the realtime input and output bit states on the port:
 
-    'SET' if the bit is set
-    'clr' if the bit is clear.
+- 'SET' if the bit is set
+- 'clr' if the bit is clear.
 
 You can use the UP/DOWN arrow keys to move the inverse "cursor" (the white block) to focus on a particular I/O pins:
 
-    When sitting on an input (bold), the speaker audibly 'beeps' like a multimeter whenever the input is SET.
-    When sitting on an output (normal), hit the ENTER key to toggle the state of that pin's output.
+- When sitting on an input (bold), the speaker audibly 'beeps' like a multimeter whenever the input is SET.
+- When sitting on an output (normal), hit the ENTER key to toggle the state of that pin's output.
 
 Any 8255 ports programmed as inputs will include a scrolling 'oscilloscope' that runs along the right edge of the screen next to that pin, showing the set/clear state. The scrolling aspect allows one to more easily oscillations on the input. The little dots that scroll by on the top line are 1 second timing markers.
 
-![Help screen](https://github.com/erco77/8255-dos/blob/master/8255-help-screen.jpg)
+![Help screen](https://github.com/erco77/8255-dos/blob/main/8255-help-screen.jpg)
 
 Hit ESC to exit this program.
