@@ -1,240 +1,371 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <time.h>
 #include <dos.h>
 #include <conio.h>
 
-#include "utype.h"
+#undef outp		// Turbo C 3.0 needs this
 
-#undef outp		// TC 3.0 needs this
+#define VERSION "2.10"
 
-// TODO: Bring over neat stuff from parallel.c
-//       Use kbhit() + getch() instead of inp(0x60), DISABLEINTS
-//       Use Pin struct to keep track of last value, redraw prevention
-//       Use Plot(x,y,c) instead of printf() to keep down cursor noise
-//       Add use of sound(3000) if input under cursor is SET.
-//       Add HelpAndExit() docs
+//
+// 8255.c - DOS 8255 DIO board monitoring program
+//
+// (C) Copyright Greg Ercolano 1988, 2007.
+// (C) Copyright Seriss Corporation 2008, 2020.
+// Available under GPL3. http://github.com/erco77/8255-dos
+//
+// v1.00 05/29/00 erco@3dsite.com - (yes, memorial day weekend)
+// v2.00 03/15/02 erco@3dsite.com - added output control
+// v2.10 09/02/23 erco@seriss.com - rewrite: ported parallel.c program to support 8255
+//
+// 80 //////////////////////////////////////////////////////////////////////////
 //
 
-#define VERSION "2.00"
-#define DISABLEINTS()  outp(0x21, inp(0x21)|2)
-#define ENABLEINTS()   outp(0x21, (inp(0x21)|2)^2)
+typedef unsigned char  uchar;
+typedef unsigned short ushort;
+typedef unsigned long  ulong;
 
-/* MONITOR THE BITS ON THE 8255 I/O BOARD AT SPECIFIED PORT ADDRESS
- *    1.00 erco 05/29/00 - (yes, memorial day weekend)
- *    2.00 erco 03/15/02 - added output control
- */
+// Tone frequency (in HZ) when an input pin is logic high
+#define TONE_FREQ	3000
 
-/* WRITE STRING TO VIDEO MEMORY
- * Supply Y position, array of characters, array of attributes for each
- * char, and 'overwrite' to end of line flag. Used exclusivly by RUNBAR().
- */
-void bar(int x, int y,		/* y location on screen */
-	 char *string)		/* the string to put on screen */
-{
-    int t;
-    uchar far *mono = MK_FP(0xb000, (y-1)*160+(x*2));
-    uchar far *cga  = MK_FP(0xb800, (y-1)*160+(x*2));
+// Pin->dir
+#define OUT 1
+#define IN  2
+#define GND 3
 
-    for (t=0; string[t]; t++) {
-        *mono = string[t]; mono += 2;
-	*cga  = string[t]; cga  += 2;
-    }
+// ANSI colors
+#define NORMAL    "\033[0m"
+#define BOLD      "\033[1m"
+#define UNDERLINE "\033[4m"
+#define INVERSE   "\033[7m"
+
+// A SINGLE PORT PIN
+//    It's port and mask, in|out, inverted, label, screen position..
+//
+typedef struct {
+    int x,y;	 	// x/y position on screen
+    int port;		// port offset. actual_port = (G_baseaddr+port)
+    int mask;		// mask bit
+    int inv;		// 1=actual hardware output is inverted
+    int dir;		// IN, OUT or GND
+    const char *label; 	// label for this pin
+    uchar laststate;	// last state of port (to optimize redraws)
+} Pin;
+
+// GLOBALS
+Pin *G_pins[24];
+int G_baseaddr = -1;    // base address
+int G_ctrlreg  = -1;    // control register. Data sheet says it's write only!
+
+// CREATE AN INSTANCE OF A 'Pin' STRUCT
+Pin* MakePin(int x, int y, int port, 
+             int mask, int inv, int dir,
+	     const char *label) {
+    Pin *p = (Pin*)malloc(sizeof(Pin));
+    p->x         = x;
+    p->y         = y;
+    p->port      = port;
+    p->mask      = mask;
+    p->inv       = inv;
+    p->dir       = dir;
+    p->label     = label;
+    p->laststate = -1;
+    return p;
 }
 
-/* SCROLL SINGLE LINE RIGHT STARTING AT x,y */
-void scrollright(int x,int y)
+// PEEK THE BYTE AT ADDRESS <segment>:<offset>
+//    Used mainly to read BIOS memory at 0040:xxxx
+uchar PeekByte(ushort segment, ushort offset)
+{
+    uchar far *addr = MK_FP(segment, offset);
+    return *addr;
+}
+
+// INITIALIZE G_pins[] ARRAY
+void Init(void)
+{
+    // Read the control port bits to determine in or out.
+    uchar port_ax_io = (G_ctrlreg & 0x10) ? IN : OUT;	// port A
+    uchar port_bx_io = (G_ctrlreg & 0x02) ? IN : OUT;	// port B
+    uchar port_cl_io = (G_ctrlreg & 0x01) ? IN : OUT;	// port C lo
+    uchar port_ch_io = (G_ctrlreg & 0x08) ? IN : OUT;	// port C hi
+    int y = 2;
+    int i = 0;
+
+    //                    X   Y     PORT MASK  INV DIR  LABEL
+    //                    -   -     ---- ----  --- ---  ---------
+    G_pins[i++] = MakePin(5,  y++,  0,   0x01, 0,  port_ax_io, "Port A[0]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x02, 0,  port_ax_io, "Port A[1]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x04, 0,  port_ax_io, "Port A[2]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x08, 0,  port_ax_io, "Port A[3]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x10, 0,  port_ax_io, "Port A[4]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x20, 0,  port_ax_io, "Port A[5]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x40, 0,  port_ax_io, "Port A[6]");
+    G_pins[i++] = MakePin(5,  y++,  0,   0x80, 0,  port_ax_io, "Port A[7]");
+
+    G_pins[i++] = MakePin(5,  y++,  1,   0x01, 0,  port_bx_io, "Port B[0]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x02, 0,  port_bx_io, "Port B[1]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x04, 0,  port_bx_io, "Port B[2]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x08, 0,  port_bx_io, "Port B[3]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x10, 0,  port_bx_io, "Port B[4]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x20, 0,  port_bx_io, "Port B[5]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x40, 0,  port_bx_io, "Port B[6]");
+    G_pins[i++] = MakePin(5,  y++,  1,   0x80, 0,  port_bx_io, "Port B[7]");
+
+    G_pins[i++] = MakePin(5,  y++,  2,   0x01, 0,  port_cl_io, "Port C[0]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x02, 0,  port_cl_io, "Port C[1]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x04, 0,  port_cl_io, "Port C[2]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x08, 0,  port_cl_io, "Port C[3]");
+
+    G_pins[i++] = MakePin(5,  y++,  2,   0x10, 0,  port_ch_io, "Port C[4]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x20, 0,  port_ch_io, "Port C[5]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x40, 0,  port_ch_io, "Port C[6]");
+    G_pins[i++] = MakePin(5,  y++,  2,   0x80, 0,  port_ch_io, "Port C[7]");
+}
+
+// SEND A TONE TO THE SPEAKER
+void Tone(int onoff)
+{
+    static int last = 0;
+    if ( onoff== 0 )  { nosound();        last = 0; return; }
+    if ( last == 0 )  { sound(TONE_FREQ); last = 1; return; }
+}
+
+// SCROLL SINGLE LINE RIGHT STARTING AT x,y
+void ScrollRight(int x, int y)
 {
     uchar far *mono = MK_FP(0xb000, (y-1)*160+160-1-2); // (x*2));
     uchar far *cga  = MK_FP(0xb800, (y-1)*160+160-1-2); // (x*2));
-    for ( ; x < 79; x++ ) {
+    for ( ; x < 80; x++ ) {
         // ATTRIB                      // CHAR
 	*(mono+2) = *mono; mono--;     *(mono+2) = *mono; mono--;
 	*(cga+2)  = *cga;  cga--;      *(cga+2)  = *cga;  cga--;
     }
 }
 
-/* RETURN INFO FOR A GIVEN POSITION */
-void PositionInfo(int portbase,
-		  int pos,
-		  char *name,
-		  int *port,
-		  int *bitmask,
-		  int *connpin)
+// PLOT CHAR 'c' AT POSITION x,y
+void Plot(int x, int y, uchar c)
 {
-    switch ( pos )
-    {
-        /* PORT A */
-        case  0: *name='A'; *port=portbase+0; *bitmask=0x01;*connpin=37; break;
-        case  1: *name='A'; *port=portbase+0; *bitmask=0x02;*connpin=36; break;
-        case  2: *name='A'; *port=portbase+0; *bitmask=0x04;*connpin=35; break;
-        case  3: *name='A'; *port=portbase+0; *bitmask=0x08;*connpin=34; break;
-        case  4: *name='A'; *port=portbase+0; *bitmask=0x10;*connpin=33; break;
-        case  5: *name='A'; *port=portbase+0; *bitmask=0x20;*connpin=32; break;
-        case  6: *name='A'; *port=portbase+0; *bitmask=0x40;*connpin=31; break;
-        case  7: *name='A'; *port=portbase+0; *bitmask=0x80;*connpin=30; break;
-
-	/* PORT B */
-        case  8: *name='B'; *port=portbase+1; *bitmask=0x01;*connpin=10; break;
-        case  9: *name='B'; *port=portbase+1; *bitmask=0x02;*connpin= 9; break;
-        case 10: *name='B'; *port=portbase+1; *bitmask=0x04;*connpin= 8; break;
-        case 11: *name='B'; *port=portbase+1; *bitmask=0x08;*connpin= 7; break;
-        case 12: *name='B'; *port=portbase+1; *bitmask=0x10;*connpin= 6; break;
-        case 13: *name='B'; *port=portbase+1; *bitmask=0x20;*connpin= 5; break;
-        case 14: *name='B'; *port=portbase+1; *bitmask=0x40;*connpin= 4; break;
-        case 15: *name='B'; *port=portbase+1; *bitmask=0x80;*connpin= 3; break;
-
-	/* PORT C */
-        case 16: *name='C'; *port=portbase+2; *bitmask=0x01;*connpin=29; break;
-        case 17: *name='C'; *port=portbase+2; *bitmask=0x02;*connpin=28; break;
-        case 18: *name='C'; *port=portbase+2; *bitmask=0x04;*connpin=27; break;
-        case 19: *name='C'; *port=portbase+2; *bitmask=0x08;*connpin=26; break;
-        case 20: *name='C'; *port=portbase+2; *bitmask=0x10;*connpin=25; break;
-        case 21: *name='C'; *port=portbase+2; *bitmask=0x20;*connpin=24; break;
-        case 22: *name='C'; *port=portbase+2; *bitmask=0x40;*connpin=23; break;
-        case 23: *name='C'; *port=portbase+2; *bitmask=0x80;*connpin=22; break;
-    }
+    uchar far *mono = MK_FP(0xb000, ((y-1)*160)+(x*2));
+    uchar far *cga  = MK_FP(0xb800, ((y-1)*160)+(x*2));
+    *mono = c;
+    *cga  = c;
 }
 
-void UpdateLine(int portbase,
-		int pos,		// 0..24
-		int cursor_pos)
+// BREAK (^C) HANDLER
+void BreakHandler(void)
 {
-    int port,
-        bitmask,
-        onoff,
-        connpin;
-    char name[2] = "X";
-
-    /* GET POSITION INFO */
-    PositionInfo(portbase, pos, name, &port, &bitmask, &connpin);
-    onoff = inp(port) & bitmask;
-
-    /* SEEK POSITION ON SCREEN */
-    printf("\033[%d;1H\033[0m\r", pos+2);
-
-    /* HANDLE PRINTING VERTICAL BRACKETS */
-         if ( bitmask == 0x01 ) printf("  %c%c ", 0xda, 0xc4);
-    else if ( bitmask == 0x10 ) printf("%c %c  ", name[0], 0xb3); 
-    else if ( bitmask == 0x80 ) printf("  %c%c ", 0xc0, 0xc4);
-    else                        printf("  %c  ", 0xb3);
-
-    /* SCROLL PREVIOUS BITSTATE RIGHT ONE CHAR */
-    scrollright(26, pos+2);
-
-    /* PRINT DATA AT PIN */
-    {
-	char *color;
-	     if ( cursor_pos == pos ) { color = "\033[7m"; }
-	else if ( pos & 0x01 )        { color = "\033[1m"; }
-	else                          { color = "\033[0m"; }
-
-	printf("%s%02d  0x%04x 0x%02x - %s\033[0m %c",
-	   color, connpin, port, bitmask,
-	   (onoff) ? "SET" : "clr",
-	   (onoff) ? '-' : '_');
-    }
+    signal(SIGINT, BreakHandler);
 }
 
-void InitScreen(int portbase, int cursor_pos)
+// SHOW HELP AND EXIT PROGRAM
+void HelpAndExit(void)
 {
-    int t;
-
-    printf("\033[2J\033[1H\r     Pin Port   Mask   State   (PORTBASE=0x%04x)",
-        portbase);
-
-    for ( t=0; t<24; t++ )
-	UpdateLine(portbase, t, cursor_pos);
+    printf(
+        "8255 - monitor/control an 8255 CIO/DIO card's 24 bit ports A,B,C\n"
+	"    VERSION v%s\n"
+	"    (C) Copyright Greg Ercolano 1988, 2007.\n"
+	"    (C) Copyright Seriss Corporation 2008, 2023.\n"
+	"    Available under GPL3. http://github.com/erco77/8255-dos\n"
+        "\n"
+        "USAGE\n"
+	"    8255 [-h] [-q] [baseaddr] [ctrlreg]\n"
+	"\n"
+        "EXAMPLES\n"
+	"    8255         - monitor baseaddr 300 hex (default)\n"
+	"    8255 200     - monitor baseaddr 200 hex\n"
+	"    8255 200 9b  - monitor baseaddr 200 hex as all inputs\n"
+	"                   (9b=control register value for all inputs)\n"
+	"    8255 -q      - quiet (disable tone)\n"
+	"    8255 -h[elp] - this help screen\n"
+	"\n"
+	"KEYS\n"
+	"    ESC        - quit program\n"
+	"    UP/DOWN    - move edit cursor up/down\n"
+	"    ENTER      - toggles state of output (when cursor on an output)\n"
+	"\n"
+        "    While edit cursor is on an input, speaker makes a %d HZ tone.\n",
+	VERSION, TONE_FREQ);
+    exit(0);
 }
 
 int main(int argc, char **argv)
 {
-    int cursor_pos = 0;		/* 0 thru 23 */
-    int portbase = 0x0300;	/* whatever the 8255 port address is */
-    int done = 0;
-    int t;
+    int i;
+    int edit     = 0;	  // pin# currently being edited
+    int done     = 0;	  // set to 1 when user hits ESC
+    int redraw   = 1;	  // set to 1 to do a full redraw
+    int quiet    = 0;     // set to 1 to disable tone
+    ulong lasttime = time(NULL);
 
-    /* PARSE COMMAND LINE */
-    if ( argc >= 2 ) {
-	if ( argv[1][0] == '-' || 
-	     sscanf(argv[1], "%x", &portbase) != 1 ) {
-	    fprintf(stderr,"8255 - monitor 3 ports on an 8255 I/O board\n");
-	    fprintf(stderr,"VERSION %s\n", VERSION);
-	    fprintf(stderr,"Greg Ercolano 05/29/00. Public domain software.\n"
-	                   "\n"
-	                   "  usage: 8255 [port]\n"
-	                   "example: 8255 0300   # monitor ports 0x300-302\n"
-	                   "\n"
-	                   "If [port] unspecified, default port is 0x300\n"
-	                   "\n"
-	                   "KEYS\n"
-	                   "    ESC to quit\n"
-	                   "    Up/Down arrow keys to move to different pin\n"
-	                   "    Space or Enter: Toggle output under cursor.\n"
-	                   "\n");
+    // PARSE COMMAND LINE
+    for ( i=1; i<argc; i++ ) {
+
+	// -help?
+	if ( argv[i][0] == '-' ) {
+	    switch (argv[i][1]) {
+	        case 'h': HelpAndExit();
+		case 'q': quiet = 1; continue;
+	    }
+	    printf("8255: bad option '%s' (use -h for help)\n", argv[i]);
 	    exit(1);
+	}
+
+	if ( G_baseaddr == -1 ) {
+	    // Base address not yet specified? Parse it
+	    if ( sscanf(argv[i], "%x", &G_baseaddr) != 1 ) {
+		printf("8255: '%s' bad base address "
+		       "(expected e.g. 0200, 0300, etc)\n", argv[1]);
+		exit(1);
+	    }
+	    if ( G_baseaddr < 0 || G_baseaddr > 0x03ff ) {
+		printf("8255: '%s' bad port# "
+		       "(range 0 to 03ff hex)\n", argv[1]);
+		exit(1);
+	    }
+	} else if ( G_ctrlreg == -1 ) {
+	    // Ctrl reg value not yet specified? Parse it
+	    if ( sscanf(argv[i], "%x", &G_ctrlreg) != 1 ) {
+		printf("8255: '%s' bad control reg value"
+		       "(expected e.g. 80, 9b, etc)\n", argv[1]);
+		exit(1);
+	    }
+	    if ( G_ctrlreg < 0 || G_ctrlreg > 0x00ff ) {
+		printf("8255: '%s' bad control register value "
+		       "(range 0 to ff hex)\n", argv[1]);
+		exit(1);
+	    }
 	}
     }
 
-    /* SETUP INITIAL SCREEN LAYOUT */
-    InitScreen(portbase, cursor_pos);
+    // DEFAULTS IF NOT SPECIFIED BY USER
+    if ( G_baseaddr == -1 ) {
+        G_baseaddr = 0x0300;  // 300 is default
+    }
 
-    /* DISABLE INTERRUPTS SO WE CAN READ THE KEYBOARD */
-    // intflags = inp(0x21);
-    DISABLEINTS();
+    if ( G_ctrlreg  == -1 ) {
+        G_ctrlreg = inp(G_baseaddr+3); // probably bad to read! (write only?)
+    }
 
-    while (inp(0x60)<0x80) 	/* wait until key released */
-	{ }
+    // DISABLE ^C
+    //     Prevent interrupt while sound() left on..
+    //
+    BreakHandler();
 
-    /* UPDATE LOOP */
-    while ( ! done ) {
-        int key = 0;
+    // INITIALIZE G_pins[] ARRAY
+    Init();
 
-	/* KEY HIT? */
-	if ( ( key = inp(0x60) ) < 0x80 ) {
-	    while (inp(0x60)<0x80) 	/* wait until key released */
-		{ }
-	    /* printf("\033[1;70H--%02x--", key); */
-	    switch ( key ) {
+    // TOP OF SCREEN
+    printf("\33[2J\33[1;1H"); // clear screen, cursor to top
 
-		case 0x01:	/*ESC: QUIT*/
-		    done = 1;
-		    continue;
+    // PIN HEADING
+    printf("    PIN STATE  PORT MASK SIGNAL");
 
-		case 0x48: 	/* UP */
-		    if ( --cursor_pos < 0 ) cursor_pos = 23;
-		    break;
+    while (!done) {
+        Pin *p;
+        int i;
+	int port;
+	uchar state;
+	const char *statestr;
+	static int first = 1;
 
-		case 0x50:	/* DOWN */
-		    if ( ++cursor_pos > 23 ) cursor_pos = 0;
-		    break;
+	for (i=0; i<24; i++) {
+	    p     = G_pins[i];
+	    port  = G_baseaddr + p->port;
+	    state = inp(port)  & p->mask;
 
-		case 0x39:	/* SPACE */
-		case 0x1c:	/* ENTER */
-		{
-		    /* TOGGLE THE OUTPUT BIT CURSOR IS ON */
-		    char name[2] = "x";
-		    int port, bitmask, connpin, byte;
-		    PositionInfo(portbase, cursor_pos, 
-		                 name, &port, &bitmask, &connpin);
+	    // REDRAW LINE ONLY IF STATE CHANGED
+	    if ( redraw || state != p->laststate ) {
+	        statestr = (p->dir==GND) ? "gnd" :
+		           (state)       ? "SET" :
+			   "clr";
+		// HANDLE PIN COLOR
+		if ( i == edit ) printf(INVERSE);
+		if ( p->dir == IN) printf(BOLD);
+		// SHOW PIN
+		printf("\033[%d;%dH%2d   %s   %04x %c%02x  %s",
+		    p->y, p->x, 
+		    i+1, statestr,
+		    port, (p->inv?'!':' '),
+		    p->mask, p->label);
+		printf(NORMAL);
+		p->laststate = state;	// save state change
+	    }
 
-		    byte = inp(port);	/* read byte */
-		    byte ^= bitmask;	/* toggle bit */
-		    outp(port, byte);	/* write byte */
-		    break;
-		}
+	    // UPDATE INPUT "OSCILLOSCOPE"
+	    if ( p->dir == IN ) {
+		ScrollRight(35, p->y);	                // rotate line right
+		Plot(35, p->y, (state ? 0xdf : '_'));	// display state in left column
+	    }
 
-		default:
-		    break;
+	    // TONE SOUND IF INPUT PIN UNDER EDIT CURSOR 'SET'
+	    if ( (i == edit) && !quiet ) {
+	        if ( p->dir == IN ) Tone(state ? 1 : 0);
+		else                Tone(0);
 	    }
 	}
 
-	for ( t=0; t<24; t++ )
-	    UpdateLine(portbase, t, cursor_pos);
+	// "OSCILLOSCOPE" SECONDS MARKERS
+	{
+	    ulong lt = time(NULL);
+	    ScrollRight(35, 1);
+	    Plot(35, 1, (lt != lasttime) ? '.' : ' ');	// c2, b3
+	    lasttime = lt;
+	}
 
 	delay(25);	// not too fast
-    }
 
-    ENABLEINTS();
-    printf("\033[24H\n");
+	// NO LONGER FIRST EXECUTION
+	first  = 0;
+	redraw = 0;
+
+//	// KEEP CURSOR POSITIONED AT EDIT CURSOR
+	printf("\033[%d;%dH", G_pins[edit]->y, G_pins[edit]->x-1);
+
+	/* KEYBOARD HANDLER */
+	if (kbhit()) {
+	    uchar c = getch();
+	    // printf("\033[2HKEY=%02x\n", c);
+	    switch (c) {
+	        case ' ':
+		case 0x1b:
+		case 'q':
+		    done = 1;
+		    break;
+
+	        case '\r':
+	        case '\n': {
+		    // CHANGE VALUE OF PORT
+		    p = G_pins[edit];			// pin being edited
+		    if ( p->dir == IN ) break;		// early exit if input
+		    port = G_baseaddr + p->port;	// port
+		    state = inp(port);			// get current value
+		    state ^= p->mask;			// toggle bit
+		    outp(port, state);			// write modified value
+		    redraw = 1;
+		    break;
+		}
+
+	        case 0:
+		    c = getch();
+		    // printf("\033[2HKEY=%02x\n", c);
+		    switch(c) {
+			case 0x48:	/* UP ARROW */
+			    if (--edit < 0) edit = 0;
+			    redraw = 1;
+			    break;
+		        case 0x50: 	/* DOWN ARROW */
+			    if (++edit > 23) edit = 23;
+			    redraw = 1;
+			    break;
+		    }
+		    break;
+	    }
+	}
+    }
+    nosound();	// TurboC: stop sound
+    printf("\033[0m\033[25H");
     return 0;
 }
