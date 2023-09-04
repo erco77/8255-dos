@@ -31,3 +31,12 @@ Any 8255 ports programmed as inputs will include a scrolling 'oscilloscope' that
 ![Help screen](https://github.com/erco77/8255-dos/blob/main/8255-help-screen.jpg)
 
 Hit 'Esc' or 'q' to exit the program and return to DOS.
+
+REQUIREMENTS
+------------
+"ANSI.SYS" needs to be installed for screen positioning and colors to work, or you'll see control characters.
+In your C:\CONFIG.SYS file, make sure you have:
+
+    DEVICE=C:\DOS\ANSI.SYS
+
+..adjust the path to ANSI.SYS based on where your DOS directory is installed; ANSI.SYS comes with DOS.
